@@ -3,6 +3,8 @@ try:
 except BaseException:
     import generic as g
 
+from collections import Counter
+
 
 def test_rabbit():
     # A BSD-licensed test model from pyglet
@@ -609,6 +611,411 @@ def test_no_vertices():
         trimesh.util.wrap_as_stream("vn 0 0 1\nf 1 2 3\n"), file_type="obj"
     )
     assert len(empty.geometry) == 0
+
+
+# ---------------------------------------------------------------------------
+# round-trip semantics: shared positions do not imply shared normals / UVs
+# ---------------------------------------------------------------------------
+
+
+def _parse_obj_face_records(text):
+    """
+    A deliberately small and independent reference OBJ parser.
+
+    Unlike the trimesh loader this keeps the three Wavefront index spaces
+    (position `v`, texture `vt` and normal `vn`) fully separate, including
+    negative relative indices, and returns one semantic record per face:
+    each face is three corner tuples of
+
+        (position, normal or None, uv or None, material name or None)
+
+    Polygon faces are triangulated with the same first-vertex fan used by
+    trimesh, so records can be compared across an export/import cycle even
+    though the exporter only emits triangles. Two face *multisets* matching
+    means every face still points at the same combination of position,
+    normal, UV and material regardless of any legal vertex splitting, face
+    reordering or cyclic corner permutation the loader/exporter performed.
+    """
+    v = []
+    vt = []
+    vn = []
+    current_material = None
+    faces = []
+
+    def resolve(index, count):
+        # wavefront indices are 1-based; negative indices are relative
+        return index - 1 if index > 0 else count + index
+
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        split = line.split()
+        key = split[0]
+        if key == "v":
+            v.append([float(x) for x in split[1:4]])
+        elif key == "vt":
+            vt.append([float(x) for x in split[1:3]])
+        elif key == "vn":
+            vn.append([float(x) for x in split[1:4]])
+        elif key == "usemtl":
+            current_material = line[len("usemtl") :].strip()
+        elif key == "f":
+            refs = []
+            for token in split[1:]:
+                parts = token.split("/")
+                iv = resolve(int(parts[0]), len(v))
+                if len(parts) > 1 and parts[1]:
+                    it = resolve(int(parts[1]), len(vt))
+                else:
+                    it = None
+                if len(parts) > 2 and parts[2]:
+                    inn = resolve(int(parts[2]), len(vn))
+                else:
+                    inn = None
+                refs.append((iv, it, inn))
+            # first-vertex fan triangulation matching trimesh
+            for a, b, c in (
+                (refs[0], refs[i], refs[i + 1]) for i in range(1, len(refs) - 1)
+            ):
+                faces.append(
+                    tuple(
+                        (
+                            tuple(g.np.round(v[iv], 8)),
+                            tuple(g.np.round(vn[inn], 8)) if inn is not None else None,
+                            tuple(g.np.round(vt[it], 8)) if it is not None else None,
+                            current_material,
+                        )
+                        for iv, it, inn in (a, b, c)
+                    )
+                )
+    return faces
+
+
+def _scene_face_records(scene):
+    """
+    Collect the same semantic per-face records from a loaded scene.
+
+    Geometry is moved through its scene graph transform so positions are
+    compared in world space, and the material assigned to each sub-mesh is
+    attached to every one of its faces.
+    """
+    faces = []
+    for node in scene.graph.nodes_geometry:
+        transform, geometry_name = scene.graph[node]
+        mesh = scene.geometry[geometry_name]
+        if not hasattr(mesh, "faces"):
+            continue
+        # the material each face of this geometry renders with
+        material = getattr(getattr(mesh, "visual", None), "material", None)
+        material_name = getattr(material, "name", None)
+        # bake the instance transform into the positions
+        points = g.trimesh.transform_points(mesh.vertices.copy(), transform)
+        uv = getattr(mesh.visual, "uv", None)
+        normals = mesh.vertex_normals if "vertex_normals" in mesh._cache.cache else None
+        for face in mesh.faces:
+            faces.append(
+                tuple(
+                    (
+                        tuple(g.np.round(points[vertex_index], 8)),
+                        tuple(g.np.round(normals[vertex_index], 8))
+                        if normals is not None
+                        else None,
+                        tuple(g.np.round(uv[vertex_index], 8))
+                        if uv is not None
+                        else None,
+                        material_name,
+                    )
+                    for vertex_index in face
+                )
+            )
+    return faces
+
+
+def _material_key(name):
+    """
+    Normalize a material name for semantic comparison.
+
+    Meshes with UVs but no `usemtl` always render through an auto-generated
+    empty material (``material_0``), so an explicit "no material" and the
+    synthesized one are semantically identical. Explicitly named materials
+    keep their names so cross-material stitching remains detectable.
+    """
+    if name is None:
+        return None
+    if str(name).startswith("material_") and str(name)[9:].isdigit():
+        return None
+    return name
+
+
+def _canonical_face(face):
+    """
+    Canonicalize one face's three corners.
+
+    A cyclic corner rotation keeps the same winding and is the same face,
+    while a reversed order flips the orientation and must not compare
+    equal. Material names are normalized through `_material_key`.
+    """
+    corners = tuple((p, n, t, _material_key(m)) for p, n, t, m in face)
+    return min(corners[i:] + corners[:i] for i in range(3))
+
+
+def _assert_face_records_match(a, b):
+    """
+    Compare per-face semantic records as multisets.
+
+    The judgment is geometric/attribute based: a face is identified by the
+    position+normal+UV+material tuples of its three corners, never by raw
+    vertex indices or the total vertex count. Vertex splitting and
+    reordering are therefore legal while cross-object or cross-material
+    stitching changes the tuples and is detected here.
+    """
+    missing = Counter(map(_canonical_face, a)) - Counter(map(_canonical_face, b))
+    extra = Counter(map(_canonical_face, b)) - Counter(map(_canonical_face, a))
+    message = "\n".join(
+        [
+            "face semantics diverged across the OBJ round trip",
+            f"missing records: {list(missing)[:3]}",
+            f"unexpected records: {list(extra)[:3]}",
+        ]
+    )
+    assert not missing and not extra, message
+
+
+def test_obj_roundtrip_negative_indices_semantics():
+    # the negative index model has separate position / UV / normal index
+    # spaces including negative relative indices and quads: every face must
+    # keep its position, normal and UV corner correspondence after export
+    mesh = g.get_mesh(
+        "negative_indices.obj", process=False, merge_tex=True, merge_norm=True
+    )
+    # sanity check on the source file itself
+    with open(g.get_path("negative_indices.obj")) as file_obj:
+        truth = _parse_obj_face_records(file_obj.read())
+    assert len(truth) == len(mesh.faces)
+
+    exported = mesh.export(file_type="obj")
+    reloaded = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(exported),
+        file_type="obj",
+        process=False,
+    )
+    records = _scene_face_records(reloaded)
+
+    # geometric/attribute semantics must survive, vertex count is only a
+    # secondary check because unmerging is allowed to duplicate vertices
+    _assert_face_records_match(truth, records)
+    assert g.np.isclose(mesh.area, reloaded.area)
+
+
+def _material_switch_obj():
+    # two objects, two materials, shared positions across objects and
+    # per-corner normals/UVs that differ even when positions coincide:
+    # a shared position must not cause normals/UVs to be shared
+    obj = """
+mtllib switches.mtl
+o alpha
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+vt 0.0 0.0
+vt 1.0 0.0
+vt 1.0 1.0
+vt 0.0 1.0
+vn 0 0 1
+usemtl red
+f 1/1/1 2/2/1 3/3/1
+f 1/1/1 3/3/1 4/4/1
+o beta
+v 0 0 0
+v 0 0 1
+v 1 0 1
+v 1 0 0
+vt 0.2 0.2
+vt 0.8 0.2
+vt 0.8 0.8
+vt 0.2 0.8
+vn 0 -1 0
+usemtl blue
+f 6/6/2 5/5/2 7/7/2
+f 7/7/2 5/5/2 8/8/2
+"""
+    mtl = """
+newmtl red
+Kd 0.9 0.1 0.1
+newmtl blue
+Kd 0.1 0.1 0.9
+"""
+    return obj, mtl
+
+
+def test_obj_roundtrip_multi_object_material_switch():
+    obj, mtl = _material_switch_obj()
+    truth = _parse_obj_face_records(obj)
+    # the source really does switch both object and material
+    assert {face[0][-1] for face in truth} == {"red", "blue"}
+
+    resolver = g.trimesh.resolvers.ZipResolver({"switches.mtl": mtl.encode()})
+    scene = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(obj),
+        file_type="obj",
+        resolver=resolver,
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+    assert len(scene.geometry) == 2
+
+    exported, assets = g.trimesh.exchange.obj.export_obj(
+        scene, return_texture=True, include_normals=True
+    )
+    reloaded = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(exported),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver(assets),
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+
+    # every face keeps its position, normal, UV and material correspondence
+    _assert_face_records_match(truth, _scene_face_records(reloaded))
+    # auxiliary info only: splitting/indexing may change vertex totals
+    assert reloaded.area == scene.area
+    materials = {
+        mesh.visual.material.name
+        for mesh in reloaded.geometry.values()
+        if getattr(mesh.visual, "material", None) is not None
+    }
+    assert materials == {"red", "blue"}
+
+
+def test_obj_semantics_allow_vertex_split_and_reorder():
+    # legitimate re-indexing: duplicate a shared corner and permute the
+    # vertices, which must NOT be flagged as an error as long as every face
+    # keeps the same position/normal/UV/material semantics
+    obj, mtl = _material_switch_obj()
+    truth = _parse_obj_face_records(obj)
+
+    scene = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(obj),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver({"switches.mtl": mtl.encode()}),
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+    mesh = next(iter(scene.geometry.values()))
+    # append a fully consistent duplicate of the corner used by the first
+    # face corner (same position, normal AND UV), then point that corner at
+    # the duplicate and permute every row
+    corner = mesh.faces[0, 0]
+    vertices = g.np.vstack((mesh.vertices, mesh.vertices[corner]))
+    normals = g.np.vstack((mesh.vertex_normals, mesh.vertex_normals[corner]))
+    uv = g.np.vstack((mesh.visual.uv, mesh.visual.uv[corner]))
+    faces = mesh.faces.copy()
+    faces[0, 0] = len(vertices) - 1
+    perm = g.np.random.default_rng(0).permutation(len(vertices))
+    inverse = g.np.empty_like(perm)
+    inverse[perm] = g.np.arange(len(perm))
+    visual = g.trimesh.visual.TextureVisuals(uv=uv[perm], material=mesh.visual.material)
+    reordered = g.trimesh.Trimesh(
+        vertices=vertices[perm],
+        faces=inverse[faces],
+        vertex_normals=normals[perm],
+        process=False,
+        visual=visual,
+    )
+    exported, assets = g.trimesh.exchange.obj.export_obj(
+        reordered, return_texture=True, include_normals=True
+    )
+    reloaded = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(exported),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver(assets),
+        process=False,
+    )
+
+    # same face semantics despite more vertices and a different ordering
+    name = mesh.visual.material.name
+    expected = [face for face in truth if face[0][-1] == name]
+    _assert_face_records_match(expected, _scene_face_records(reloaded))
+
+
+def test_obj_semantics_detect_cross_material_stitch():
+    # corrupt a mesh by swapping UVs between the two materials so faces keep
+    # their positions but render with the other material's texture coords:
+    # a vertex-count based check would miss this, the semantic one does not
+    obj, mtl = _material_switch_obj()
+    scene = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(obj),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver({"switches.mtl": mtl.encode()}),
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+    meshes = list(scene.geometry.values())
+    uv_sets = [mesh.visual.uv.copy() for mesh in meshes]
+    # stitch the wrong UV block onto each object
+    meshes[0].visual.uv = uv_sets[1][: len(meshes[0].vertices)]
+    meshes[1].visual.uv = uv_sets[0][: len(meshes[1].vertices)]
+
+    exported, assets = g.trimesh.exchange.obj.export_obj(
+        scene, return_texture=True, include_normals=True
+    )
+    reloaded = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(exported),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver(assets),
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+
+    # positions and face count are intact, but the UV correspondence is not
+    assert reloaded.area == scene.area
+    with g.pytest.raises(AssertionError):
+        _assert_face_records_match(
+            _parse_obj_face_records(obj), _scene_face_records(reloaded)
+        )
+
+
+def test_obj_semantics_detect_cross_object_stitch():
+    # corrupt by moving the second object's faces onto the first object's
+    # positions: the per-face position tuples change and must be detected
+    obj, mtl = _material_switch_obj()
+    scene = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(obj),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver({"switches.mtl": mtl.encode()}),
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+    target = list(scene.geometry.values())[1]
+    # rewire every face onto a single in-bounds vertex so all three corners
+    # now carry the wrong position tuple: face/vertex counts stay identical,
+    # only the geometric correspondence breaks
+    target.faces = g.np.zeros_like(target.faces)
+
+    exported, assets = g.trimesh.exchange.obj.export_obj(
+        scene, return_texture=True, include_normals=True
+    )
+    reloaded = g.trimesh.load_scene(
+        g.trimesh.util.wrap_as_stream(exported),
+        file_type="obj",
+        resolver=g.trimesh.resolvers.ZipResolver(assets),
+        process=False,
+        split_objects=True,
+        group_material=False,
+    )
+
+    with g.pytest.raises(AssertionError):
+        _assert_face_records_match(
+            _parse_obj_face_records(obj), _scene_face_records(reloaded)
+        )
 
 
 if __name__ == "__main__":
