@@ -474,6 +474,249 @@ def test_exact_bounds():
     assert g.np.allclose(m.bounds, dump.bounds)
 
 
+def test_unshare_geometry():
+    # three instances of one shared mesh
+    box = g.trimesh.creation.box(extents=[1, 2, 3])
+    scene = g.trimesh.Scene()
+    scene.add_geometry(box, geom_name="box", node_name="node_0")
+    for name, x in [("node_1", 3.0), ("node_2", -3.0)]:
+        scene.graph.update(
+            frame_to=name, matrix=g.tf.translation_matrix([x, 0, 0]), geometry="box"
+        )
+    # every node references the same key
+    assert set(scene.graph.geometry_nodes) == {"box"}
+    before_bounds = scene.bounds.copy()
+    before_pose = scene.graph["node_0"][0].copy()
+
+    key = scene.unshare_geometry("node_1")
+
+    # the detached instance gets its own key and geometry object
+    assert key != "box"
+    assert scene.geometry[key] is not scene.geometry["box"]
+    # the geometry is identical until something changes it
+    assert g.np.allclose(scene.geometry[key].bounds, box.bounds)
+    # the untouched instances keep sharing the original key
+    assert set(scene.graph.geometry_nodes["box"]) == {"node_0", "node_2"}
+    assert scene.graph.geometry_nodes[key] == ["node_1"]
+    # world poses and the overall bounds didn't move
+    assert g.np.allclose(scene.graph["node_0"][0], before_pose)
+    assert g.np.allclose(scene.bounds, before_bounds)
+    assert scene.is_valid
+
+    # changing the private copy only affects that instance
+    scene.geometry[key].apply_transform(g.tf.scale_matrix(4.0))
+    assert g.np.allclose(scene.geometry["box"].bounds, box.bounds)
+    # the scaled copy sits at x=3 with half-extents [2, 4, 6]
+    assert g.np.allclose(scene.bounds[1], [5.0, 4.0, 6.0])
+    # the minimum x is still the untouched instance at x=-3
+    assert g.np.allclose(scene.bounds[0], [-3.5, -4.0, -6.0])
+
+    # a node which already has private geometry is returned unchanged
+    assert scene.unshare_geometry("node_1") == key
+
+
+def test_unshare_geometry_aliases():
+    # the same mesh object stored under two keys is still shared:
+    # changing one key would change the other instance too
+    mesh = g.trimesh.creation.box()
+    scene = g.trimesh.Scene()
+    scene.add_geometry(mesh, geom_name="a", node_name="node_a")
+    scene.add_geometry(mesh, geom_name="b", node_name="node_b")
+    assert scene.geometry["a"] is scene.geometry["b"]
+
+    key = scene.unshare_geometry("node_a")
+
+    # only the requested node was detached
+    assert key not in {"a", "b"}
+    assert scene.geometry[key] is not mesh
+    assert scene.geometry["b"] is mesh
+    assert scene.graph["node_b"][1] == "b"
+    assert scene.graph["node_a"][1] == key
+    assert scene.is_valid
+
+
+def test_unshare_geometry_missing():
+    scene = g.trimesh.Scene(g.trimesh.creation.box())
+    for node in ["not-a-node", scene.graph.base_frame]:
+        with g.pytest.raises(ValueError):
+            scene.unshare_geometry(node)
+
+
+def test_transform_instance_parent_mirror():
+    # a parent frame with a negative scale mirrors its children
+    mirror = g.np.eye(4)
+    mirror[0, 0] = -1.0
+    box = g.trimesh.creation.box(extents=[1, 2, 3])
+    scene = g.trimesh.Scene()
+    scene.graph.update(frame_to="mirror", matrix=mirror)
+    near = scene.add_geometry(
+        box,
+        geom_name="part",
+        node_name="near",
+        parent_node_name="mirror",
+        transform=g.tf.translation_matrix([2, 0, 0]),
+    )
+    # reference the same geometry key from a second node
+    scene.graph.update(
+        frame_to="far",
+        frame_from="mirror",
+        matrix=g.tf.translation_matrix([-2, 0, 0]),
+        geometry="part",
+    )
+    assert len(scene.graph.geometry_nodes["part"]) == 2
+    other_pose = scene.graph["far"][0].copy()
+    before_bounds = scene.bounds.copy()
+
+    # transform just one instance in the base frame
+    key = scene.transform_instance(near, g.tf.translation_matrix([0, 0, 1]))
+
+    # the other instance keeps both its geometry and its world pose
+    assert scene.graph["far"][1] == "part"
+    assert g.np.allclose(scene.graph["far"][0], other_pose)
+    assert g.np.allclose(scene.geometry["part"].bounds, box.bounds)
+    # the node itself is still under the mirrored parent
+    assert scene.graph.transforms.parents[near] == "mirror"
+    assert g.np.isclose(scene.graph[near][0][0, 3], -2.0)
+
+    # the modified copy is well formed despite the mirrored parent
+    moved = scene.geometry[key]
+    assert moved.is_winding_consistent
+    assert moved.is_watertight
+    assert moved.volume > 0.0
+    outward = (moved.face_normals * (moved.triangles_center - moved.centroid)).sum(axis=1)
+    assert outward.min() > 0.0
+
+    # the whole scene bounds follow the modified geometry
+    assert g.np.allclose(scene.bounds[1], [2.5, 1.0, 2.5])
+    assert before_bounds[0, 0] == scene.bounds[0, 0]
+    assert scene.is_valid
+
+
+def test_transform_instance_mirror():
+    # a reflection applied to one instance must flip winding and normals
+    box = g.trimesh.creation.box(extents=[1, 2, 3])
+    scene = g.trimesh.Scene()
+    keep = scene.add_geometry(box, geom_name="box")
+    flip = scene.add_geometry(
+        box, geom_name="box", transform=g.tf.translation_matrix([5, 0, 0])
+    )
+
+    mirror = g.np.eye(4)
+    mirror[0, 0] = -1.0
+    key = scene.transform_instance(flip, mirror)
+    moved = scene.geometry[key]
+
+    assert moved.is_winding_consistent
+    assert moved.is_watertight
+    outward = (moved.face_normals * (moved.triangles_center - moved.centroid)).sum(axis=1)
+    assert outward.min() > 0.0
+
+    # the world position of the modified instance reflects the transform:
+    # the node matrix is unchanged so the baked copy carries the change
+    world = g.trimesh.transformations.transform_points(
+        moved.vertices, matrix=scene.graph[flip][0]
+    )
+    assert g.np.allclose(world.min(axis=0), [-5.5, -1.0, -1.5])
+    assert g.np.allclose(world.max(axis=0), [-4.5, 1.0, 1.5])
+
+    # the untouched instance is unchanged and still shared by itself
+    assert scene.graph[keep][1] == "box"
+    assert g.np.allclose(scene.geometry["box"].bounds, box.bounds)
+
+
+def test_transform_instance_shared_gltf():
+    # one geometry key used by three nodes
+    box = g.trimesh.creation.box(extents=[1, 1, 2])
+    scene = g.trimesh.Scene()
+    scene.add_geometry(box, geom_name="shared", node_name="node_0")
+    for i, x in enumerate([3.0, 0.0, -3.0]):
+        scene.graph.update(
+            frame_to=f"node_{i + 1}",
+            matrix=g.tf.translation_matrix([x, 0, 0]),
+            geometry="shared",
+        )
+    assert len(scene.graph.geometry_nodes["shared"]) == 4
+
+    # color and move a single instance
+    key = scene.transform_instance("node_2", g.tf.translation_matrix([0, 4, 0]))
+    scene.geometry[key].visual.face_colors = [255, 0, 0, 255]
+    scene_bounds = scene.bounds.copy()
+
+    # the other three nodes keep the one shared reference
+    assert set(scene.graph.geometry_nodes["shared"]) == {
+        "node_0",
+        "node_1",
+        "node_3",
+    }
+    assert scene.graph.geometry_nodes[key] == ["node_2"]
+
+    export = scene.export(file_type="glb")
+    reloaded = g.trimesh.load(g.trimesh.util.wrap_as_stream(export), file_type="glb")
+
+    # the appearance and overall bounds survive the round trip
+    assert g.np.allclose(reloaded.bounds, scene_bounds, atol=1e-5)
+    assert set(reloaded.graph.geometry_nodes) == set(scene.graph.geometry_nodes)
+    # the three unmodified instances still reference one shared mesh
+    shared = reloaded.graph.geometry_nodes["shared"]
+    assert len(shared) == 3
+    # and the modified instance references its own copy and keeps its color
+    assert reloaded.graph.geometry_nodes[key] == ["node_2"]
+    assert g.np.allclose(
+        reloaded.geometry[key].visual.main_color, [255, 0, 0, 255], atol=1
+    )
+    # while the shared instances keep the default color
+    assert not g.np.allclose(
+        reloaded.geometry["shared"].visual.main_color, [255, 0, 0, 255]
+    )
+
+
+def test_transform_instance_path():
+    # a 2D path shared by two instances
+    path = g.trimesh.load_path(
+        g.np.array([[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]], dtype=float)
+    )
+    scene = g.trimesh.Scene()
+    first = scene.add_geometry(path, geom_name="path")
+    scene.graph.update(
+        frame_to="second",
+        matrix=g.tf.translation_matrix([2, 0, 0]),
+        geometry="path",
+    )
+    assert scene.is_valid
+
+    # an in-plane transform keeps the geometry 2D and moves only this instance
+    first_key = scene.transform_instance(first, g.tf.translation_matrix([0, 3, 0]))
+    moved = scene.geometry[first_key]
+    assert moved.vertices.shape[1] == 2
+    assert g.np.allclose(scene.bounds, [[0.0, 0.0, 0.0], [3.0, 4.0, 0.0]])
+
+    # a transform leaving the plane promotes just the modified instance to 3D
+    rotation = g.np.array(
+        [[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=float
+    )
+    second_key = scene.transform_instance("second", rotation)
+    assert second_key != first_key
+    assert scene.geometry[second_key].vertices.shape[1] == 3
+    # the other instance is still the 2D copy it was before
+    assert scene.geometry[first_key].vertices.shape[1] == 2
+    assert scene.is_valid
+
+
+def test_shared_geometry_unchanged_by_default():
+    # callers which don't use the new feature keep the old behavior:
+    # editing the geometry key still changes every instance
+    box = g.trimesh.creation.box()
+    scene = g.trimesh.Scene()
+    scene.add_geometry(box, geom_name="box", node_name="a")
+    scene.graph.update(
+        frame_to="b", matrix=g.tf.translation_matrix([3, 0, 0]), geometry="box"
+    )
+    assert len(scene.graph.geometry_nodes["box"]) == 2
+
+    scene.geometry["box"].apply_transform(g.tf.scale_matrix(2.0))
+    assert g.np.allclose(scene.bounds, [[-1.0, -1.0, -1.0], [4.0, 1.0, 1.0]])
+
+
 def test_concatenate_mixed():
     scene = g.trimesh.Scene(
         [

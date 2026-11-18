@@ -250,6 +250,179 @@ class Scene(Geometry3D):
         # remove the geometries from our geometry store
         [self.geometry.pop(name, None) for name in names]
 
+    def unshare_geometry(self, node: Hashable, name: Hashable | None = None) -> Hashable:
+        """
+        Give a single instance its own copy of the geometry it references.
+
+        Scenes commonly reference the same geometry from many nodes, which
+        means changing `scene.geometry[key]` alters every instance at once.
+        This detaches one node so that only that instance changes while the
+        pose of every node and the sharing of all other instances is kept.
+
+        The copy holds exactly the same vertices in the same local frame as
+        the original, so the scene bounds and every world pose are unchanged
+        until the returned geometry is actually modified.
+
+        Parameters
+        --------------
+        node : hashable
+          Name of a node in `scene.graph` which references geometry.
+        name : hashable or None
+          Key in `scene.geometry` for the copy. If None a unique name
+          derived from the current key will be generated.
+
+        Returns
+        ---------------
+        geometry : hashable
+          Key in `scene.geometry` now referenced by `node`. If the
+          geometry was already used only by this node it is returned
+          unchanged and nothing is copied.
+
+        Raises
+        -------------
+        ValueError
+          If the node does not exist, does not reference geometry, or
+          the requested name is already in use by another geometry.
+        """
+        # get the geometry reference stored on this node
+        attr = self.graph.transforms.node_data.get(node)
+        if attr is None or "geometry" not in attr:
+            raise ValueError(f"node `{node}` does not reference any geometry")
+        # the key of the geometry this instance currently references
+        current = attr["geometry"]
+        if current not in self.geometry:
+            raise ValueError(f"node `{node}` references missing geometry `{current}`")
+        geometry = self.geometry[current]
+
+        # nodes which would change if `geometry` were modified, which
+        # includes aliases where one object is stored under many keys
+        node_data = self.graph.transforms.node_data
+        instances = set(self.graph.geometry_nodes.get(current, []))
+        instances.update(
+            n
+            for n, other in node_data.items()
+            if "geometry" in other
+            and other["geometry"] in self.geometry
+            and self.geometry[other["geometry"]] is geometry
+        )
+        # a second key holding the same object is also a shared reference
+        aliased = sum(1 for other in self.geometry.values() if other is geometry) > 1
+
+        if len(instances) <= 1 and not aliased:
+            # only this instance references the geometry so it is already
+            # independent and there is nothing to copy
+            return current
+
+        if name is None:
+            # generate a name which isn't already in the scene
+            name = unique_name(start=str(current), contains=self.geometry.keys())
+        elif name in self.geometry:
+            raise ValueError(f"geometry `{name}` already exists in the scene")
+
+        if util.is_instance_named(geometry, "Trimesh"):
+            # copy cached values like explicit vertex normals so the
+            # instance keeps its appearance until it is changed
+            copied = geometry.copy(include_cache=True)
+        else:
+            copied = geometry.copy()
+
+        # store the copy and point only this node at it: the graph
+        # transforms are untouched so the world pose of every node holds
+        self.geometry[name] = copied
+        node_data[node]["geometry"] = name
+        # the geometry name is part of the graph hash so invalidate it
+        # which also dumps any cached transform or node listings
+        self.graph.transforms._hash = None
+
+        # if no node references the old geometry anymore, for example
+        # because it was only reachable through this node under another
+        # key, drop it so `Scene.is_valid` still describes the scene
+        if current != name and current not in self.graph.geometry_nodes:
+            self.geometry.pop(current, None)
+
+        return name
+
+    def transform_instance(
+        self, node: Hashable, matrix: ArrayLike, world: bool = True
+    ) -> Hashable:
+        """
+        Apply a transform to a single instance and nothing else.
+
+        The instance is detached from shared geometry first with
+        `unshare_geometry` and the transform is then baked into that
+        private copy. The scene graph, the pose of every other node and
+        the sharing between all other instances are left alone.
+
+        Baked transforms follow the usual `Trimesh.apply_transform`
+        conventions: a transform which flips the winding reverses the
+        faces and their normals so the geometry stays consistently wound.
+        Since the same local transform is used whether the node is under a
+        parent or not, parent transforms and negative parent scaling are
+        preserved exactly.
+
+        Parameters
+        --------------
+        node : hashable
+          Name of a node in `scene.graph` which references geometry.
+        matrix : (4, 4) float
+          Homogeneous transformation to apply.
+        world : bool
+          If True `matrix` is in the base frame, which is what callers
+          usually expect, and it is converted into the node's local
+          frame before it is applied. If False `matrix` is already in
+          the node's own frame and is applied directly.
+
+        Returns
+        ---------------
+        geometry : hashable
+          Key in `scene.geometry` now referenced by `node`, which is
+          guaranteed not to be referenced by any other node.
+        """
+        matrix = np.asanyarray(matrix, dtype=float64)
+        if matrix.shape != (4, 4):
+            raise ValueError("transform matrix must be (4, 4)")
+
+        # look up the world pose first so an invalid node fails
+        # before anything in the scene has been changed
+        attr = self.graph.transforms.node_data.get(node)
+        if attr is None or "geometry" not in attr:
+            raise ValueError(f"node `{node}` does not reference any geometry")
+        current = self.graph[node][0]
+
+        if world:
+            # conjugate the world transform into the node's local frame
+            # so the world pose of this instance becomes `matrix @ current`
+            matrix = util.multi_dot([np.linalg.inv(current), matrix, current])
+
+        # detach this instance before changing anything
+        name = self.unshare_geometry(node)
+        geometry = self.geometry[name]
+        vertices = getattr(geometry, "vertices", None)
+
+        if vertices is not None and vertices.shape[1] == 2:
+            # 2D geometry only accepts a (3, 3) transform while it stays
+            # in the plane, so use just the in-plane part when possible
+            flat = np.array([0.0, 0.0, 1.0, 0.0])
+            if util.allclose(matrix[2, :], flat) and util.allclose(
+                matrix[:2, 2], np.zeros(2)
+            ):
+                # keep the 2D translation from the homogeneous matrix
+                translated = matrix[:3, :3].copy()
+                translated[:2, 2] = matrix[:2, 3]
+                matrix = translated
+            elif hasattr(geometry, "to_3D"):
+                # the transform leaves the plane so promote to 3D
+                geometry = geometry.to_3D()
+                self.geometry[name] = geometry
+            else:
+                raise ValueError(
+                    f"geometry `{name}` is 2D and the transform leaves the plane"
+                )
+
+        geometry.apply_transform(matrix)
+
+        return name
+
     def strip_visuals(self) -> None:
         """
         Strip visuals from every Trimesh geometry
