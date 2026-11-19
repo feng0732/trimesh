@@ -98,7 +98,8 @@ class Transform:
         Returns
         -------------
         scale : (3,) float
-          Scale factor from the matrix
+          Scale factor from the matrix, signed so a
+          mirrored axis is negative
         """
         # get the current transformation
         matrix = self.matrix
@@ -110,15 +111,18 @@ class Transform:
 
     @caching.cache_decorator
     def pitch(self):
-        scale = self.scale
-        if not util.allclose(scale[0], scale[1:], np.max(np.abs(scale)) * 1e-6 + 1e-8):
+        # mirroring an axis doesn't change the size of a voxel
+        scale = np.abs(self.scale)
+        if not util.allclose(scale[0], scale[1:], np.max(scale) * 1e-6 + 1e-8):
             raise RuntimeError("transform features non-uniform scaling")
         return scale
 
     @caching.cache_decorator
     def unit_volume(self):
         """Volume of a transformed unit cube."""
-        return np.linalg.det(self._data["transform_matrix"][:3, :3])
+        # the determinant of a mirrored transform is negative but
+        # the space taken up by a voxel is still positive
+        return np.abs(np.linalg.det(self._data["transform_matrix"][:3, :3]))
 
     def apply_transform(self, matrix):
         """Mutate the transform in-place and return self."""

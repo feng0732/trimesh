@@ -125,6 +125,7 @@ def local_voxelize(
 
     # sparse, origin = voxelize_subdivide(local, pitch, **kwargs)
     vox = voxelize_subdivide(local, pitch, **kwargs)
+    # position of the center of the voxel at index zero
     origin = vox.transform[:3, 3]
     matrix = vox.encoding.dense
 
@@ -144,7 +145,8 @@ def local_voxelize(
         center[1] - radius : center[1] + radius + 1,
         center[2] - radius : center[2] + radius + 1,
     ]
-    local_origin = point - radius * pitch  # origin of local voxels
+    # center of the voxel at index zero of the returned grid
+    local_origin = point - radius * pitch
 
     # Fill internal regions
     if fill:
@@ -159,7 +161,11 @@ def local_voxelize(
         internal = np.isin(regions.flatten(), where).reshape(regions.shape)
         voxels = np.logical_or(voxels, internal)
 
-    return base.VoxelGrid(voxels, tr.translation_matrix(local_origin))
+    # the indices of the returned grid are voxel centers spaced by
+    # `pitch` starting at `local_origin`
+    return base.VoxelGrid(
+        voxels, tr.scale_and_translate(scale=pitch, translate=local_origin)
+    )
 
 
 @log_time

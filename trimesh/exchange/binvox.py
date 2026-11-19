@@ -274,6 +274,12 @@ def export_binvox(voxel, axis_order="xzy"):
     """
     Export `trimesh.voxel.VoxelGrid` instance to bytes
 
+    binvox only stores a positive uniform scale and a translation, so
+    the grid must not be rotated, sheared or scaled non-uniformly.
+    A grid mirrored along an axis is stored by flipping that axis of
+    the occupancy grid and shifting the translation so the voxels
+    stay in the same world-space position.
+
     Parameters
     ------------
     voxel : `trimesh.voxel.VoxelGrid`
@@ -288,21 +294,49 @@ def export_binvox(voxel, axis_order="xzy"):
     -----------
     result : bytes
       Representation according to binvox spec
+
+    Raises
+    -----------
+    ValueError
+      If the transform has rotation, shear or non-uniform scale
+      as binvox cannot represent those.
     """
-    translate = voxel.translation
-    scale = voxel.scale * (np.array(voxel.shape) - 1)
-    (neg_scale,) = np.where(scale < 0)
-    encoding = voxel.encoding.flip(neg_scale)
-    scale = np.abs(scale)
-    if not util.allclose(scale[0], scale[1:], 1e-6 * scale[0] + 1e-8):
-        raise ValueError("Can only export binvox with uniform scale")
-    scale = scale[0]
+    try:
+        scale = voxel.scale
+    except RuntimeError as E:
+        # `voxel.scale` raises if the transform is a rotation or shear
+        raise ValueError(
+            "binvox can only store translation, scale and mirroring: " + str(E)
+        )
+    shape = np.array(voxel.shape, dtype=np.int64)
+    # binvox `scale` is the distance between the outermost voxel
+    # centers along each axis
+    spacing = scale * (shape - 1)
+    magnitude = np.abs(spacing)
+    if not util.allclose(magnitude[0], magnitude[1:], 1e-6 * magnitude[0] + 1e-8):
+        raise ValueError(
+            "Can only export binvox with uniform scale, "
+            + f"got spacing {spacing!s} along each axis"
+        )
+
+    # a voxel is symmetric so a mirrored axis can be stored by
+    # flipping the occupancy data, but the origin also has to move
+    # so the voxels stay in the same world-space position
+    translate = np.array(voxel.translation, dtype=np.float64)
+    (flip,) = np.nonzero(scale < 0.0)
+    translate[flip] += spacing[flip]
+    encoding = voxel.encoding
+    if len(flip) > 0:
+        encoding = encoding.flip(flip)
+
     if axis_order == "xzy":
         encoding = encoding.transpose((0, 2, 1))
     elif axis_order != "xyz":
         raise ValueError('Invalid axis_order: must be one of ("xyz", "xzy")')
     rle_data = encoding.flat.run_length_data(dtype=np.uint8)
-    return binvox_bytes(rle_data, shape=voxel.shape, translate=translate, scale=scale)
+    return binvox_bytes(
+        rle_data, shape=voxel.shape, translate=translate, scale=float(magnitude[0])
+    )
 
 
 class Binvoxer:
